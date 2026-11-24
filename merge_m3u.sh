@@ -7,6 +7,8 @@
 #   自动备份到 <m3u目录>/bak/ 子目录。
 #   兼容两种格式: 标准 #EXTINF/group-title 格式与旧版 "名字,rtp://"+"#genre#"
 #   格式(可混合), 输出格式跟随基准文件。
+#   自动读取脚本同级 config.yaml, 把 params 键下的键值(如 fcc)以查询串
+#   形式附加到每个 rtp:// 地址末尾。
 #
 # 用法:
 #   ./merge_m3u.sh                        # 合并脚本同级的 ./m3u 目录, 基准 main.m3u
@@ -27,4 +29,5 @@ M3U_DIR="${1:-$SCRIPT_DIR/m3u}"
 BASE_NAME="${2:-main.m3u}"
 
 # 交给 python 脚本执行, 退出码原样透传
-exec python3 "$SCRIPT_DIR/merge_m3u.py" --dir "$M3U_DIR" --base "$BASE_NAME"
+exec python3 "$SCRIPT_DIR/merge_m3u.py" --dir "$M3U_DIR" --base "$BASE_NAME" \
+    --config "$SCRIPT_DIR/config.yaml"

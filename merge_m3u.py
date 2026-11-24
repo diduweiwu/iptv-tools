@@ -15,7 +15,13 @@ merge_m3u.py —— 组播频道合并工具
          tvg-id/tvg-logo 等属性原样保留, 旧格式来源的新频道自动生成
          只含 group-title 的最简属性; 基准是旧格式则按 "频道名,地址" 输出;
       5. 写回前自动把基准文件备份到 m3u 目录下的 bak/ 子目录
-         (如 m3u/bak/main.m3u.bak)。
+         (如 m3u/bak/main.m3u.bak);
+      6. 若存在配置文件 config.yaml, 其中 params 键下的每个键值会作为
+         查询参数附加到每个 rtp:// 地址末尾, 如配置:
+             params:
+               fcc: 183.223.164.65:8027
+         会在每个地址后面追加 "?fcc=183.223.164.65:8027"; 地址上已有的
+         旧查询串会被统一替换, 不会重复叠加。
 
 支持两种文件格式(同一文件内可混合, 自动识别):
     标准 M3U 格式:
@@ -31,6 +37,7 @@ merge_m3u.py —— 组播频道合并工具
     python3 merge_m3u.py --dir /path/to/m3u --base main.m3u --no-backup
     python3 merge_m3u.py --dir m3u --sort natural   # 不用拼音, 按字符排序
     python3 merge_m3u.py --dir m3u --sort none      # 保持原出现顺序不排序
+    python3 merge_m3u.py --config /path/to/config.yaml  # 指定参数配置文件
 
 退出码: 0 成功; 1 参数/运行出错。
 """
@@ -50,12 +57,20 @@ try:
 except ImportError:
     HAS_PINYIN = False
 
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
 EXTM3U_PREFIX = '#EXTM3U'   # 标准 m3u 文件头前缀
 EXTINF_PREFIX = '#EXTINF'   # 标准 m3u 频道信息行前缀
 GENRE_SUFFIX = '#genre#'    # 旧格式频道分组行后缀, 如: 央视,#genre#
 RTP_PREFIX = 'rtp://'       # 组播地址前缀, 只合并这类地址
 GROUP_TITLE_RE = re.compile(r'group-title="([^"]*)"')  # 分组属性提取
 DEFAULT_GROUP = '其它'       # 未声明分组的频道默认归入的分组名
+DEFAULT_CONFIG = 'config.yaml'  # 默认参数配置文件名(脚本工作目录下)
+PARAMS_KEY = 'params'       # 配置文件中存放 rtp 附加参数的顶层键名
 DETAIL_LIMIT = 10           # 摘要中最多展示的"异名重复地址"明细条数
 UNGROUPED = ''              # "未声明分组"的占位分组名
 
@@ -334,6 +349,7 @@ class M3uParser:
                         name = src_name.strip()
                 else:
                     url = line.strip()
+                url = cls._canonical_url(url)  # 去掉已有查询串, 保证去重不受附加参数影响
                 if not name:
                     doc.ignored += 1
                     continue
@@ -380,6 +396,24 @@ class M3uParser:
         """
         matched = GROUP_TITLE_RE.search(line)
         return matched.group(1).strip() if matched else ''
+
+    @staticmethod
+    def _canonical_url(url: str) -> str:
+        """地址规范化: 去掉 rtp 地址上已有的查询串("??" 之后的部分)。
+
+        查询串(如 ?fcc=...)属于输出时统一附加的参数而非地址本身,
+        解析阶段统一去掉后, 按地址去重才不受附加参数影响。
+
+        参数:
+            url: 组播地址, 可能带查询串。
+        返回:
+            去掉查询串后的纯地址。
+
+        使用示例:
+            M3uParser._canonical_url('rtp://239.11.0.65:5140?fcc=1.2.3.4:8027')
+            # 返回 'rtp://239.11.0.65:5140'
+        """
+        return url.split('?', 1)[0]
 
     @staticmethod
     def _register(doc: M3uDocument, current: str, name: str, url: str,
@@ -505,21 +539,89 @@ class M3uMerger:
         stat.added += 1
 
 
-class ExtM3uRenderer:
+class RtpParamDecorator:
+    """rtp 地址参数装饰器(装饰器模式): 给 rtp:// 地址动态附加查询参数。
+
+    附加前会先去掉地址上已有的查询串, 保证重复运行、修改配置时
+    参数整体替换、不会叠加出 "?fcc=..?fcc=.." 这类地址。
+
+    使用示例:
+        deco = RtpParamDecorator({'fcc': '183.223.164.65:8027'})
+        deco.decorate('rtp://239.11.0.65:5140')
+        # 返回 'rtp://239.11.0.65:5140?fcc=183.223.164.65:8027'
+        deco.decorate('https://example.com/logo.png')  # 非 rtp 地址原样返回
+    """
+
+    def __init__(self, params: 'OrderedDict[str, object]'):
+        """初始化装饰器。
+
+        参数:
+            params: 查询参数字典(保持配置书写顺序), 如
+                {'fcc': '183.223.164.65:8027'}; 为空时不修改任何地址。
+        """
+        self.params = OrderedDict(params or {})
+
+    def decorate(self, url: str) -> str:
+        """给单个地址附加查询参数(非 rtp:// 地址原样返回)。
+
+        参数:
+            url: 原始地址。
+        返回:
+            附加参数后的地址, 如
+            'rtp://239.11.0.65:5140?fcc=183.223.164.65:8027'。
+        """
+        if not self.params or not url.startswith(RTP_PREFIX):
+            return url
+        query = '&'.join('{}={}'.format(key, value)
+                         for key, value in self.params.items())
+        return '{}?{}'.format(url.split('?', 1)[0], query)
+
+
+class BaseM3uRenderer:
+    """渲染器基类(模板方法模式): 统一持有排序策略与地址参数装饰器,
+    子类实现 render 定义各自的输出骨架。"""
+
+    def __init__(self, sorter: ChannelSorter,
+                 url_decorator: Optional[RtpParamDecorator] = None):
+        """初始化渲染器公共部分。
+
+        参数:
+            sorter: 频道排序策略。
+            url_decorator: 地址参数装饰器, None 表示不附加参数。
+        """
+        self.sorter = sorter
+        self.url_decorator = url_decorator
+
+    def emit_url(self, url: str) -> str:
+        """输出单个地址行: 有装饰器时先附加参数, 否则原样返回。
+
+        参数:
+            url: 频道的组播地址。
+        返回:
+            处理后的地址文本。
+        """
+        if self.url_decorator is not None:
+            return self.url_decorator.decorate(url)
+        return url
+
+
+class ExtM3uRenderer(BaseM3uRenderer):
     """标准 M3U 格式渲染器: 每个频道输出 "#EXTINF:...,名字" + 地址两行。
 
     已有属性段的频道原样保留(tvg-id/tvg-logo 等); 没有属性段的频道
     (旧格式来源的新频道)生成只含 group-title 的最简属性段。
     """
 
-    def __init__(self, sorter: ChannelSorter, header: str = ''):
+    def __init__(self, sorter: ChannelSorter, header: str = '',
+                 url_decorator: Optional[RtpParamDecorator] = None):
         """初始化渲染器。
 
         参数:
             sorter: 频道排序策略。
             header: 基准文件的 "#EXTM3U" 行原文, 空串时使用标准文件头。
+            url_decorator: 地址参数装饰器, None 表示不附加参数。
         """
-        self.sorter = sorter
+        super().__init__(sorter, url_decorator)
         self.header = header or EXTM3U_PREFIX
 
     def render(self, groups: 'OrderedDict[str, OrderedDict[str, Channel]]') -> str:
@@ -540,20 +642,22 @@ class ExtM3uRenderer:
             for channel in self.sorter.sort(list(channels.values())):
                 attrs = channel.extinf_attrs or '-1 group-title="{}"'.format(gname)
                 lines.append('#EXTINF:{},{}'.format(attrs, channel.name))
-                lines.extend(channel.urls)
+                lines.extend(self.emit_url(url) for url in channel.urls)
         return '\n'.join(lines) + '\n'
 
 
-class GenreRenderer:
+class GenreRenderer(BaseM3uRenderer):
     """旧格式渲染器: "分组,#genre#" 分组行 + "频道名,地址" 频道行, 分组间空行。"""
 
-    def __init__(self, sorter: ChannelSorter):
+    def __init__(self, sorter: ChannelSorter,
+                 url_decorator: Optional[RtpParamDecorator] = None):
         """初始化渲染器。
 
         参数:
             sorter: 频道排序策略。
+            url_decorator: 地址参数装饰器, None 表示不附加参数。
         """
-        self.sorter = sorter
+        super().__init__(sorter, url_decorator)
 
     def render(self, groups: 'OrderedDict[str, OrderedDict[str, Channel]]') -> str:
         """渲染为旧格式文本。
@@ -572,25 +676,67 @@ class GenreRenderer:
                 continue
             lines = ['{},{}'.format(gname, GENRE_SUFFIX)]
             for channel in self.sorter.sort(list(channels.values())):
-                lines.extend('{},{}'.format(channel.name, url)
+                lines.extend('{},{}'.format(channel.name, self.emit_url(url))
                              for url in channel.urls)
             blocks.append('\n'.join(lines))
         return '\n\n'.join(blocks) + '\n'
 
 
-def create_renderer(base_doc: M3uDocument,
-                    sorter: ChannelSorter) -> 'ExtM3uRenderer | GenreRenderer':
+def create_renderer(base_doc: M3uDocument, sorter: ChannelSorter,
+                    url_decorator: Optional[RtpParamDecorator] = None
+                    ) -> 'ExtM3uRenderer | GenreRenderer':
     """渲染器工厂(工厂模式): 输出格式跟随基准文件格式。
 
     参数:
         base_doc: 基准文件的解析结果(含格式标记与文件头)。
         sorter: 频道排序策略。
+        url_decorator: 地址参数装饰器, None 表示不附加参数。
     返回:
         ExtM3uRenderer(基准为标准格式)或 GenreRenderer(基准为旧格式)。
     """
     if base_doc.use_extinf:
-        return ExtM3uRenderer(sorter, header=base_doc.header)
-    return GenreRenderer(sorter)
+        return ExtM3uRenderer(sorter, header=base_doc.header,
+                              url_decorator=url_decorator)
+    return GenreRenderer(sorter, url_decorator=url_decorator)
+
+
+def load_rtp_params(config_path: Path) -> 'OrderedDict[str, object]':
+    """读取参数配置文件中 params 键下的参数, 作为 rtp:// 地址的查询参数。
+
+    配置格式示例:
+        params:
+          fcc: 183.223.164.65:8027
+    params 下的每个键值都会以 "?键=值" 形式追加到每个 rtp 地址末尾;
+    配置文件不存在或没有 params 键时返回空字典(不附加参数, 兼容旧流程)。
+
+    参数:
+        config_path: 配置文件路径。
+    返回:
+        OrderedDict{参数名: 参数值}, 保持配置文件中的书写顺序。
+    异常:
+        ValueError: 配置文件存在但无法解析(未安装 PyYAML, 或 params
+            的内容不是键值映射)时抛出。
+    """
+    if not config_path.is_file():
+        return OrderedDict()
+    if not HAS_YAML:
+        raise ValueError(
+            '发现配置文件 {} 但未安装 PyYAML, '
+            '请先执行: pip3 install --user pyyaml'.format(config_path))
+    with config_path.open(encoding='utf-8-sig') as handle:
+        data = yaml.safe_load(handle)
+    if not data:
+        return OrderedDict()
+    if not isinstance(data, dict):
+        raise ValueError('配置文件 {} 的内容应为键值映射'.format(config_path))
+    params = data.get(PARAMS_KEY)
+    if params is None:
+        return OrderedDict()
+    if not isinstance(params, dict):
+        raise ValueError(
+            '配置文件 {} 中 {} 的内容应为 "参数名: 参数值" 映射'.format(
+                config_path, PARAMS_KEY))
+    return OrderedDict(params)
 
 
 def get_backup_path(m3u_dir: Path, base_path: Path) -> Path:
@@ -630,7 +776,8 @@ def iter_source_files(m3u_dir: Path, base_path: Path) -> Iterator[Path]:
 def print_summary(stats: List[MergeStat],
                   groups: 'OrderedDict[str, OrderedDict[str, Channel]]',
                   base_path: Path, backup_path: Optional[Path],
-                  base_ignored: int = 0) -> None:
+                  base_ignored: int = 0,
+                  rtp_params: 'Optional[OrderedDict[str, object]]' = None) -> None:
     """打印合并统计与结果概览。
 
     参数:
@@ -639,6 +786,7 @@ def print_summary(stats: List[MergeStat],
         base_path: 被写回的基准文件路径。
         backup_path: 备份文件路径(未备份时为 None)。
         base_ignored: 基准文件中被丢弃的无法解析行数。
+        rtp_params: 已附加的 rtp 查询参数(未启用时为 None/空)。
     """
     print('===== 合并统计 =====')
     for stat in stats:
@@ -664,18 +812,22 @@ def print_summary(stats: List[MergeStat],
     print('===== 结果 =====')
     print('分组 {} 个, 频道 {} 个, 组播地址 {} 条'.format(
         len(groups), channel_count, url_count))
+    if rtp_params:
+        query = '&'.join('{}={}'.format(key, value)
+                         for key, value in rtp_params.items())
+        print('已为每个 rtp 地址附加参数: ?{}'.format(query))
     print('已写回: {}'.format(base_path))
     if backup_path is not None:
         print('已备份原文件: {}'.format(backup_path))
 
 
 def run(args: argparse.Namespace) -> int:
-    """执行合并主流程: 解析基准文件 -> 合并各源文件 -> 按基准格式写回并打印摘要。
+    """执行合并主流程: 解析基准文件 -> 合并各源文件 -> 附加配置参数 -> 按基准格式写回。
 
     参数:
-        args: 命令行参数(--dir/--base/--default-group/--sort/--no-backup)。
+        args: 命令行参数(--dir/--base/--default-group/--sort/--config/--no-backup)。
     返回:
-        0 成功; 1 出错(如基准文件不存在、排序参数非法)。
+        0 成功; 1 出错(如基准文件不存在、排序参数非法、配置文件格式错误)。
     """
     m3u_dir = Path(args.dir).expanduser()
     base_path = m3u_dir / args.base
@@ -687,9 +839,11 @@ def run(args: argparse.Namespace) -> int:
         return 1
     try:
         sorter = create_sorter(args.sort)
+        rtp_params = load_rtp_params(Path(args.config).expanduser())
     except ValueError as exc:
         print('错误: {}'.format(exc), file=sys.stderr)
         return 1
+    url_decorator = RtpParamDecorator(rtp_params) if rtp_params else None
 
     base_doc = M3uParser.parse(base_path)
     merger = M3uMerger(base_doc.groups, default_group=args.default_group)
@@ -700,10 +854,10 @@ def run(args: argparse.Namespace) -> int:
         backup_path = get_backup_path(m3u_dir, base_path)
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(base_path, backup_path)
-    renderer = create_renderer(base_doc, sorter)
+    renderer = create_renderer(base_doc, sorter, url_decorator=url_decorator)
     base_path.write_text(renderer.render(merger.groups), encoding='utf-8')
     print_summary(stats, merger.groups, base_path, backup_path,
-                  base_ignored=base_doc.ignored)
+                  base_ignored=base_doc.ignored, rtp_params=rtp_params or None)
     return 0
 
 
@@ -721,6 +875,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='基准文件名(位于 --dir 下), 其他文件合并进它, 默认: main.m3u')
     parser.add_argument('--default-group', default=DEFAULT_GROUP,
                         help='未声明分组频道的落点分组名, 默认: {}'.format(DEFAULT_GROUP))
+    parser.add_argument('--config', default=DEFAULT_CONFIG,
+                        help='参数配置文件路径, 其中 params 键下的键值会以查询串'
+                             '形式附加到每个 rtp 地址; 文件不存在则不附加, '
+                             '默认: ./{}'.format(DEFAULT_CONFIG))
     parser.add_argument('--sort', default='auto',
                         choices=['auto', 'pinyin', 'natural', 'none'],
                         help='频道排序方式: auto=有 pypinyin 用拼音否则自然排序(默认); '
