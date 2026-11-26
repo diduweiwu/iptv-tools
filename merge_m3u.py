@@ -13,7 +13,9 @@ merge_m3u.py —— 组播频道合并工具
       3. 每个分组内的频道按名称排序(有 pypinyin 时按拼音, 数字按数值);
       4. 输出格式跟随基准文件: 基准是标准 #EXTINF 格式时, 已有频道的
          tvg-id/tvg-logo 等属性原样保留, 旧格式来源的新频道自动生成
-         只含 group-title 的最简属性; 基准是旧格式则按 "频道名,地址" 输出;
+         只含 group-title 的最简属性, 频道的每个地址各复制一份 #EXTINF 行
+         (部分播放器只认 "#EXTINF 紧跟单条地址" 的条目形态);
+         基准是旧格式则按 "频道名,地址" 输出;
       5. 写回前自动把基准文件备份到 m3u 目录下的 bak/ 子目录
          (如 m3u/bak/main.m3u.bak);
       6. 若存在配置文件 config.yaml, 其中 params 键下的每个键值会作为
@@ -606,10 +608,12 @@ class BaseM3uRenderer:
 
 
 class ExtM3uRenderer(BaseM3uRenderer):
-    """标准 M3U 格式渲染器: 每个频道输出 "#EXTINF:...,名字" + 地址两行。
+    """标准 M3U 格式渲染器: 每个地址各输出一条 "#EXTINF:...,名字" + 地址。
 
-    已有属性段的频道原样保留(tvg-id/tvg-logo 等); 没有属性段的频道
-    (旧格式来源的新频道)生成只含 group-title 的最简属性段。
+    一个频道允许多个地址, 渲染时为每个地址复制一份相同的 #EXTINF 行
+    (部分播放器只认 "#EXTINF 紧跟单条地址" 的条目形态); 已有属性段的
+    频道原样保留(tvg-id/tvg-logo 等); 没有属性段的频道(旧格式来源的
+    新频道)生成只含 group-title 的最简属性段。
     """
 
     def __init__(self, sorter: ChannelSorter, header: str = '',
@@ -627,8 +631,8 @@ class ExtM3uRenderer(BaseM3uRenderer):
     def render(self, groups: 'OrderedDict[str, OrderedDict[str, Channel]]') -> str:
         """渲染为标准 M3U 文本。
 
-        首行为文件头, 之后按分组顺序、分组内按排序策略依次输出每个
-        频道的 #EXTINF 行与地址行, 不输出空行, 末尾带换行符。
+        首行为文件头, 之后按分组顺序、分组内按排序策略依次输出每个频道;
+        频道的每个地址都各配一条相同的 #EXTINF 行, 不输出空行, 末尾带换行符。
 
         参数:
             groups: 合并完成后的分组结构。
@@ -641,8 +645,10 @@ class ExtM3uRenderer(BaseM3uRenderer):
                 continue
             for channel in self.sorter.sort(list(channels.values())):
                 attrs = channel.extinf_attrs or '-1 group-title="{}"'.format(gname)
-                lines.append('#EXTINF:{},{}'.format(attrs, channel.name))
-                lines.extend(self.emit_url(url) for url in channel.urls)
+                extinf = '#EXTINF:{},{}'.format(attrs, channel.name)
+                for url in channel.urls:
+                    lines.append(extinf)      # 每个地址都复制一份频道信息行
+                    lines.append(self.emit_url(url))
         return '\n'.join(lines) + '\n'
 
 
